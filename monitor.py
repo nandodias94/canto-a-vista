@@ -59,6 +59,7 @@ def load_state():
 
     response.raise_for_status()
     data = response.json()
+    
 if endpoint == "fixtures/statistics":
     print("DEBUG API - Status:", response.status_code)
     print("DEBUG API - Resultados:", data.get("results"))
