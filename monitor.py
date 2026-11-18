@@ -114,6 +114,7 @@ def get_match_stats(fixture_id):
 
 
 def main():
+    telegram("🟢 CANTO À VISTA — Teste de ligação concluído!")
     state, sha = load_state()
     sent = set(state.get("sent", []))
 
