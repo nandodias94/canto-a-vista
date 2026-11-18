@@ -30,12 +30,15 @@ def api_get(endpoint, params=None):
     response.raise_for_status()
     data = response.json()
 
+    if endpoint == "fixtures/statistics":
+        print("DEBUG API - Status:", response.status_code)
+        print("DEBUG API - Resultados:", data.get("results"))
+        print("DEBUG API - Erros:", data.get("errors"))
+
     if data.get("errors"):
         raise RuntimeError(str(data["errors"]))
 
     return data.get("response", [])
-
-
 def telegram(message):
     response = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
