@@ -145,7 +145,7 @@ def stat_value(stats, name):
 
     return 0
 
-
+print("DEBUG - Jogo escolhido:", fixture_id)
 def get_match_stats(fixture_id):
     data = api_get(
         "fixtures/statistics",
