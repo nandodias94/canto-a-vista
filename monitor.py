@@ -3,7 +3,6 @@ import os
 import json
 import base64
 import requests
-from datetime import datetime, timezone
 
 API_KEY = os.environ["FOOTBALL_API_KEY"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -12,14 +11,19 @@ GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 REPOSITORY = os.environ["GITHUB_REPOSITORY"]
 
 BASE_URL = "https://v3.football.api-sports.io"
-HEADERS = {"x-apisports-key": API_KEY}
 STATE_FILE = "canto_state.json"
+
+API_HEADERS = {"x-apisports-key": API_KEY}
+GH_HEADERS = {
+    "Authorization": f"Bearer {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github+json"
+}
 
 
 def api_get(endpoint, params=None):
     response = requests.get(
         f"{BASE_URL}/{endpoint}",
-        headers=HEADERS,
+        headers=API_HEADERS,
         params=params,
         timeout=25
     )
@@ -41,29 +45,33 @@ def telegram(message):
     response.raise_for_status()
 
 
-def github_headers():
-    return {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json"
-    }
-
-
 def load_state():
-    url = f"https://api.github.com/repos/{REPOSITORY}/contents/{STATE_FILE}"
-    response = requests.get(url, headers=github_headers(), timeout=20)
+    url = (
+        f"https://api.github.com/repos/{REPOSITORY}"
+        f"/contents/{STATE_FILE}"
+    )
+    response = requests.get(
+        url, headers=GH_HEADERS, timeout=20
+    )
 
     if response.status_code == 404:
         return {"sent": []}, None
 
     response.raise_for_status()
     data = response.json()
-    content = base64.b64decode(data["content"]).decode("utf-8")
+
+    content = base64.b64decode(
+        data["content"]
+    ).decode("utf-8")
 
     return json.loads(content), data["sha"]
 
 
 def save_state(state, sha):
-    url = f"https://api.github.com/repos/{REPOSITORY}/contents/{STATE_FILE}"
+    url = (
+        f"https://api.github.com/repos/{REPOSITORY}"
+        f"/contents/{STATE_FILE}"
+    )
 
     content = base64.b64encode(
         json.dumps(state, indent=2).encode("utf-8")
@@ -79,38 +87,54 @@ def save_state(state, sha):
 
     response = requests.put(
         url,
-        headers=github_headers(),
+        headers=GH_HEADERS,
         json=payload,
         timeout=20
     )
     response.raise_for_status()
 
 
-def stat_value(team_stats, name):
-    for item in team_stats:
+def stat_value(stats, name):
+    for item in stats:
         if item.get("type") == name:
             value = item.get("value")
-            return int(value or 0)
+            try:
+                return int(value or 0)
+            except (ValueError, TypeError):
+                return 0
     return 0
 
 
 def get_match_stats(fixture_id):
-    data = api_get("fixtures/statistics", {"fixture": fixture_id})
+    data = api_get(
+        "fixtures/statistics",
+        {"fixture": fixture_id}
+    )
 
     if len(data) < 2:
         return None
 
     corners = 0
     shots = 0
-    shots_on_target = 0
+    shots_target = 0
 
     for team in data:
         stats = team.get("statistics", [])
         corners += stat_value(stats, "Corner Kicks")
         shots += stat_value(stats, "Total Shots")
-        shots_on_target += stat_value(stats, "Shots on Goal")
+        shots_target += stat_value(stats, "Shots on Goal")
 
-    return corners, shots, shots_on_target
+    return corners, shots, shots_target
+
+
+def get_phase(minute, status):
+    if status == "1H" and 35 <= minute <= 45:
+        return "PRIMEIRA PARTE"
+
+    if status == "2H" and 75 <= minute <= 90:
+        return "FINAL DO JOGO"
+
+    return None
 
 
 def main():
@@ -123,90 +147,113 @@ def main():
 
     for match in fixtures:
         fixture = match["fixture"]
-        teams = match["teams"]
-        goals = match["goals"]
-
+        status = fixture["status"].get("short")
         minute = fixture["status"].get("elapsed") or 0
+
+        phase = get_phase(minute, status)
+
+        if not phase:
+            continue
+
         fixture_id = fixture["id"]
+        alert_key = f"{fixture_id}:{phase}"
 
-        if fixture_id in sent:
+        if alert_key in sent:
             continue
 
-        if not 70 <= minute <= 88:
-            continue
-
-        if teams["home"]["winner"] is True or teams["away"]["winner"] is True:
-            continue
-
+        goals = match["goals"]
         home_goals = goals["home"] or 0
         away_goals = goals["away"] or 0
 
-        # Jogos empatados ou com diferença máxima de um golo
+        # Jogos equilibrados
         if abs(home_goals - away_goals) > 1:
             continue
 
-        candidates.append(match)
+        candidates.append((minute, match, phase, alert_key))
 
-    # Analisar primeiro os jogos mais próximos do final
-    candidates.sort(
-        key=lambda m: m["fixture"]["status"]["elapsed"] or 0,
-        reverse=True
-    )
-
-    # Apenas uma consulta estatística por execução
-    for match in candidates[:1]:
-        fixture = match["fixture"]
-        fixture_id = fixture["id"]
-
-        stats = get_match_stats(fixture_id)
-
-        if stats is None:
-            continue
-
-        corners, shots, shots_on_target = stats
-
-        # Filtros iniciais de pressão ofensiva
-        if corners < 6:
-            continue
-
-        if shots < 10:
-            continue
-
-        if shots_on_target < 3:
-            continue
-
-        home = match["teams"]["home"]["name"]
-        away = match["teams"]["away"]["name"]
-
-        score_home = match["goals"]["home"] or 0
-        score_away = match["goals"]["away"] or 0
-        minute = fixture["status"]["elapsed"]
-
-        message = (
-            "⚽ CANTO À VISTA ⚽\n\n"
-            f"🏟 {home} - {away}\n"
-            f"📊 Resultado: {score_home}-{score_away}\n"
-            f"⏱ Minuto: {minute}'\n\n"
-            f"🚩 Cantos: {corners}\n"
-            f"🥅 Remates: {shots}\n"
-            f"🎯 Remates à baliza: {shots_on_target}\n\n"
-            "📈 Indicadores de pressão ofensiva.\n"
-            "Possível oportunidade de mais um canto.\n"
-            "⚠️ Alerta estatístico, não garantia de canto."
-        )
-
-        telegram(message)
-
-        sent.add(fixture_id)
-        state["sent"] = list(sent)[-500:]
-        save_state(state, sha)
-
-        print(f"Alerta enviado: {home} - {away}")
-        break
+    candidates.sort(key=lambda item: item[0], reverse=True)
 
     print(f"Jogos em direto: {len(fixtures)}")
-    print(f"Jogos elegíveis: {len(candidates)}")
-    print("Monitorização concluída.")
+    print(f"Jogos dentro das janelas: {len(candidates)}")
+
+    if not candidates:
+        print("Nenhum jogo dentro das janelas de análise.")
+        return
+
+    # Uma consulta estatística por execução:
+    # protege o limite diário da API gratuita.
+    minute, match, phase, alert_key = candidates[0]
+
+    fixture = match["fixture"]
+    fixture_id = fixture["id"]
+
+    stats = get_match_stats(fixture_id)
+
+    if stats is None:
+        print("Estatísticas indisponíveis.")
+        return
+
+    corners, shots, shots_target = stats
+
+    print(
+        f"Jogo analisado: {match['teams']['home']['name']} "
+        f"- {match['teams']['away']['name']}"
+    )
+    print(
+        f"Cantos: {corners} | Remates: {shots} "
+        f"| À baliza: {shots_target}"
+    )
+
+    # Critérios exigentes por fase
+    if phase == "PRIMEIRA PARTE":
+        minimum_corners = 4
+        minimum_shots = 8
+        minimum_target = 2
+    else:
+        minimum_corners = 6
+        minimum_shots = 10
+        minimum_target = 3
+
+    if corners < minimum_corners:
+        print("Rejeitado: poucos cantos.")
+        return
+
+    if shots < minimum_shots:
+        print("Rejeitado: poucos remates.")
+        return
+
+    if shots_target < minimum_target:
+        print("Rejeitado: poucos remates à baliza.")
+        return
+
+    home = match["teams"]["home"]["name"]
+    away = match["teams"]["away"]["name"]
+
+    home_goals = match["goals"]["home"] or 0
+    away_goals = match["goals"]["away"] or 0
+
+    message = (
+        "🚩 CANTO À VISTA 🚩\n\n"
+        f"🏟 {home} - {away}\n"
+        f"📊 Resultado: {home_goals}-{away_goals}\n"
+        f"⏱ Minuto: {minute}'\n"
+        f"📍 Fase: {phase}\n\n"
+        f"🚩 Cantos totais: {corners}\n"
+        f"🥅 Remates totais: {shots}\n"
+        f"🎯 À baliza: {shots_target}\n\n"
+        "📈 Indicadores estatísticos fortes.\n"
+        "Possível oportunidade de mais um canto.\n\n"
+        "⚠️ Não é garantia de canto. "
+        "Confirma o jogo antes de qualquer entrada."
+    )
+
+    telegram(message)
+
+    sent.add(alert_key)
+    state["sent"] = list(sent)[-500:]
+    save_state(state, sha)
+
+    print("Alerta enviado com sucesso!")
 
 
 if __name__ == "__main__":
