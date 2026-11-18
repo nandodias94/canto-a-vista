@@ -4,21 +4,34 @@ import json
 import base64
 import requests
 
-API_KEY = os.environ["FOOTBALL_API_KEY"]
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-REPOSITORY = os.environ["GITHUB_REPOSITORY"]
+# =====================================
+# CONFIGURAÇÕES
+# =====================================
 
 BASE_URL = "https://v3.football.api-sports.io"
-STATE_FILE = "canto_state.json"
 
-API_HEADERS = {"x-apisports-key": API_KEY}
+API_KEY = os.getenv("FOOTBALL_API_KEY")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+REPOSITORY = os.getenv("GITHUB_REPOSITORY")
+
+STATE_FILE = "state.json"
+
+API_HEADERS = {
+    "x-apisports-key": API_KEY
+}
+
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json"
 }
 
+
+# =====================================
+# API FOOTBALL
+# =====================================
 
 def api_get(endpoint, params=None):
     response = requests.get(
@@ -27,6 +40,7 @@ def api_get(endpoint, params=None):
         params=params,
         timeout=25
     )
+
     response.raise_for_status()
     data = response.json()
 
@@ -39,22 +53,39 @@ def api_get(endpoint, params=None):
         raise RuntimeError(str(data["errors"]))
 
     return data.get("response", [])
+
+
+# =====================================
+# TELEGRAM
+# =====================================
+
 def telegram(message):
     response = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": message},
+        json={
+            "chat_id": CHAT_ID,
+            "text": message
+        },
         timeout=20
     )
+
     response.raise_for_status()
 
+
+# =====================================
+# HISTÓRICO DE ALERTAS
+# =====================================
 
 def load_state():
     url = (
         f"https://api.github.com/repos/{REPOSITORY}"
         f"/contents/{STATE_FILE}"
     )
+
     response = requests.get(
-        url, headers=GH_HEADERS, timeout=20
+        url,
+        headers=GH_HEADERS,
+        timeout=20
     )
 
     if response.status_code == 404:
@@ -62,11 +93,7 @@ def load_state():
 
     response.raise_for_status()
     data = response.json()
-    
-if endpoint == "fixtures/statistics":
-    print("DEBUG API - Status:", response.status_code)
-    print("DEBUG API - Resultados:", data.get("results"))
-    print("DEBUG API - Erros:", data.get("errors"))
+
     content = base64.b64decode(
         data["content"]
     ).decode("utf-8")
@@ -98,17 +125,24 @@ def save_state(state, sha):
         json=payload,
         timeout=20
     )
+
     response.raise_for_status()
 
+
+# =====================================
+# ESTATÍSTICAS
+# =====================================
 
 def stat_value(stats, name):
     for item in stats:
         if item.get("type") == name:
             value = item.get("value")
+
             try:
                 return int(value or 0)
             except (ValueError, TypeError):
                 return 0
+
     return 0
 
 
@@ -118,7 +152,10 @@ def get_match_stats(fixture_id):
         {"fixture": fixture_id}
     )
 
-    print(f"DEBUG - Jogo {fixture_id}: {len(data)} equipas recebidas")
+    print(
+        f"DEBUG - Jogo {fixture_id}: "
+        f"{len(data)} equipas recebidas"
+    )
 
     for item in data:
         print(
@@ -137,12 +174,28 @@ def get_match_stats(fixture_id):
 
     for team in data:
         stats = team.get("statistics", [])
-        corners += stat_value(stats, "Corner Kicks")
-        shots += stat_value(stats, "Total Shots")
-        shots_target += stat_value(stats, "Shots on Goal")
+
+        corners += stat_value(
+            stats, "Corner Kicks"
+        )
+
+        shots += stat_value(
+            stats, "Total Shots"
+        )
+
+        shots_target += stat_value(
+            stats, "Shots on Goal"
+        )
 
     return corners, shots, shots_target
+
+
+# =====================================
+# FASE DO JOGO
+# =====================================
+
 def get_phase(minute, status):
+
     if status == "1H" and 35 <= minute <= 45:
         return "PRIMEIRA PARTE"
 
@@ -152,16 +205,40 @@ def get_phase(minute, status):
     return None
 
 
+# =====================================
+# EXECUÇÃO PRINCIPAL
+# =====================================
+
 def main():
+
+    required = {
+        "FOOTBALL_API_KEY": API_KEY,
+        "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+        "TELEGRAM_CHAT_ID": CHAT_ID,
+        "GITHUB_TOKEN": GITHUB_TOKEN,
+        "GITHUB_REPOSITORY": REPOSITORY
+    }
+
+    for name, value in required.items():
+        if not value:
+            raise RuntimeError(
+                f"Configuração em falta: {name}"
+            )
+
     state, sha = load_state()
     sent = set(state.get("sent", []))
 
-    fixtures = api_get("fixtures", {"live": "all"})
+    fixtures = api_get(
+        "fixtures",
+        {"live": "all"}
+    )
 
     candidates = []
 
     for match in fixtures:
+
         fixture = match["fixture"]
+
         status = fixture["status"].get("short")
         minute = fixture["status"].get("elapsed") or 0
 
@@ -171,12 +248,14 @@ def main():
             continue
 
         fixture_id = fixture["id"]
+
         alert_key = f"{fixture_id}:{phase}"
 
         if alert_key in sent:
             continue
 
         goals = match["goals"]
+
         home_goals = goals["home"] or 0
         away_goals = goals["away"] or 0
 
@@ -184,9 +263,14 @@ def main():
         if abs(home_goals - away_goals) > 1:
             continue
 
-        candidates.append((minute, match, phase, alert_key))
+        candidates.append(
+            (minute, match, phase, alert_key)
+        )
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
 
     print(f"Jogos em direto: {len(fixtures)}")
     print(f"Jogos dentro das janelas: {len(candidates)}")
@@ -195,12 +279,10 @@ def main():
         print("Nenhum jogo dentro das janelas de análise.")
         return
 
-    # Uma consulta estatística por execução:
-    # protege o limite diário da API gratuita.
+    # Uma consulta estatística por execução
     minute, match, phase, alert_key = candidates[0]
 
-    fixture = match["fixture"]
-    fixture_id = fixture["id"]
+    fixture_id = match["fixture"]["id"]
 
     stats = get_match_stats(fixture_id)
 
@@ -211,19 +293,23 @@ def main():
     corners, shots, shots_target = stats
 
     print(
-        f"Jogo analisado: {match['teams']['home']['name']} "
-        f"- {match['teams']['away']['name']}"
-    )
-    print(
-        f"Cantos: {corners} | Remates: {shots} "
-        f"| À baliza: {shots_target}"
+        f"Jogo analisado: "
+        f"{match['teams']['home']['name']} - "
+        f"{match['teams']['away']['name']}"
     )
 
-    # Critérios exigentes por fase
+    print(
+        f"Cantos: {corners} | "
+        f"Remates: {shots} | "
+        f"À baliza: {shots_target}"
+    )
+
+    # Critérios exigentes
     if phase == "PRIMEIRA PARTE":
         minimum_corners = 4
         minimum_shots = 8
         minimum_target = 2
+
     else:
         minimum_corners = 6
         minimum_shots = 10
@@ -265,7 +351,9 @@ def main():
     telegram(message)
 
     sent.add(alert_key)
+
     state["sent"] = list(sent)[-500:]
+
     save_state(state, sha)
 
     print("Alerta enviado com sucesso!")
