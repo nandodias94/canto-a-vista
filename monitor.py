@@ -110,15 +110,17 @@ def get_match_stats(fixture_id):
         "fixtures/statistics",
         {"fixture": fixture_id}
     )
-print(f"DEBUG - Jogo {fixture_id}: {len(data)} equipas recebidas")
 
-for item in data:
-    print(
-        "DEBUG - Equipa:",
-        item.get("team", {}).get("name"),
-        "| Estatísticas:",
-        len(item.get("statistics", []))
-    )
+    print(f"DEBUG - Jogo {fixture_id}: {len(data)} equipas recebidas")
+
+    for item in data:
+        print(
+            "DEBUG - Equipa:",
+            item.get("team", {}).get("name"),
+            "| Estatísticas:",
+            len(item.get("statistics", []))
+        )
+
     if len(data) < 2:
         return None
 
@@ -133,8 +135,6 @@ for item in data:
         shots_target += stat_value(stats, "Shots on Goal")
 
     return corners, shots, shots_target
-
-
 def get_phase(minute, status):
     if status == "1H" and 35 <= minute <= 45:
         return "PRIMEIRA PARTE"
