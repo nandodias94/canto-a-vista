@@ -2,6 +2,7 @@
 import os
 import json
 import base64
+import time
 import requests
 
 # =====================================
@@ -19,6 +20,8 @@ REPOSITORY = os.getenv("GITHUB_REPOSITORY")
 
 STATE_FILE = "state.json"
 
+MAX_RETRIES = 5
+
 API_HEADERS = {
     "x-apisports-key": API_KEY
 }
@@ -30,29 +33,80 @@ GH_HEADERS = {
 
 
 # =====================================
+# ESPERA E RETENTATIVAS
+# =====================================
+
+def retry_wait(attempt, response=None):
+    wait = 2 ** (attempt + 1)
+
+    if response is not None:
+        try:
+            wait = int(response.headers.get("Retry-After", wait))
+        except (ValueError, TypeError):
+            pass
+
+    wait = min(max(wait, 1), 60)
+
+    print(f"Nova tentativa em {wait} segundos.")
+    time.sleep(wait)
+
+
+# =====================================
 # API FOOTBALL
 # =====================================
 
 def api_get(endpoint, params=None):
-    response = requests.get(
-        f"{BASE_URL}/{endpoint}",
-        headers=API_HEADERS,
-        params=params,
-        timeout=25
+
+    url = f"{BASE_URL}/{endpoint}"
+
+    for attempt in range(MAX_RETRIES):
+
+        try:
+            response = requests.get(
+                url,
+                headers=API_HEADERS,
+                params=params,
+                timeout=25
+            )
+
+            if response.status_code == 429:
+                print("API-Football: limite de pedidos atingido.")
+                retry_wait(attempt, response)
+                continue
+
+            if response.status_code in (500, 502, 503, 504):
+                print(
+                    f"API-Football erro {response.status_code}. "
+                    f"Tentativa {attempt + 1}/{MAX_RETRIES}."
+                )
+                retry_wait(attempt)
+                continue
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data.get("errors"):
+                raise RuntimeError(str(data["errors"]))
+
+            return data.get("response", [])
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        ) as error:
+
+            print(f"Falha de ligação à API: {error}")
+
+            if attempt < MAX_RETRIES - 1:
+                retry_wait(attempt)
+
+        except requests.exceptions.HTTPError:
+            raise
+
+    raise RuntimeError(
+        f"API-Football indisponível: {endpoint}"
     )
-
-    response.raise_for_status()
-    data = response.json()
-
-    if endpoint == "fixtures/statistics":
-        print("DEBUG API - Status:", response.status_code)
-        print("DEBUG API - Resultados:", data.get("results"))
-        print("DEBUG API - Erros:", data.get("errors"))
-
-    if data.get("errors"):
-        raise RuntimeError(str(data["errors"]))
-
-    return data.get("response", [])
 
 
 # =====================================
@@ -60,16 +114,88 @@ def api_get(endpoint, params=None):
 # =====================================
 
 def telegram(message):
-    response = requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={
-            "chat_id": CHAT_ID,
-            "text": message
-        },
-        timeout=20
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
     )
 
-    response.raise_for_status()
+    for attempt in range(MAX_RETRIES):
+
+        try:
+            response = requests.post(
+                url,
+                json={
+                    "chat_id": CHAT_ID,
+                    "text": message
+                },
+                timeout=20
+            )
+
+            if response.status_code == 429:
+
+                wait = 10
+
+                try:
+                    data = response.json()
+                    wait = data.get(
+                        "parameters", {}
+                    ).get("retry_after", 10)
+                except (ValueError, TypeError):
+                    pass
+
+                print("Telegram: limite de envios atingido.")
+                retry_wait(attempt)
+
+                continue
+
+            if response.status_code in (500, 502, 503, 504):
+
+                print(
+                    f"Telegram erro {response.status_code}. "
+                    f"Tentativa {attempt + 1}/{MAX_RETRIES}."
+                )
+
+                retry_wait(attempt)
+                continue
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data.get("ok"):
+                print("Mensagem enviada para o Telegram.")
+                return True
+
+            if data.get("error_code") == 429:
+
+                wait = data.get(
+                    "parameters", {}
+                ).get("retry_after", 10)
+
+                time.sleep(min(int(wait), 60))
+                continue
+
+            raise RuntimeError(
+                f"Erro Telegram: {data}"
+            )
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        ) as error:
+
+            print(f"Falha de ligação ao Telegram: {error}")
+
+            if attempt < MAX_RETRIES - 1:
+                retry_wait(attempt)
+
+        except requests.exceptions.HTTPError:
+            raise
+
+    raise RuntimeError(
+        "Telegram indisponível após várias tentativas."
+    )
 
 
 # =====================================
@@ -77,38 +203,78 @@ def telegram(message):
 # =====================================
 
 def load_state():
+
     url = (
         f"https://api.github.com/repos/{REPOSITORY}"
         f"/contents/{STATE_FILE}"
     )
 
-    response = requests.get(
-        url,
-        headers=GH_HEADERS,
-        timeout=20
+    for attempt in range(MAX_RETRIES):
+
+        try:
+            response = requests.get(
+                url,
+                headers=GH_HEADERS,
+                timeout=20
+            )
+
+            if response.status_code == 404:
+                return {"sent": []}, None
+
+            if response.status_code in (500, 502, 503, 504, 429):
+                print(
+                    f"GitHub erro {response.status_code} "
+                    "ao consultar histórico."
+                )
+                retry_wait(attempt, response)
+                continue
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            content = base64.b64decode(
+                data["content"]
+            ).decode("utf-8")
+
+            state = json.loads(content)
+
+            if not isinstance(state, dict):
+                raise RuntimeError("Histórico inválido.")
+
+            if not isinstance(state.get("sent", []), list):
+                raise RuntimeError("Lista de alertas inválida.")
+
+            return state, data["sha"]
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        ) as error:
+
+            print(f"Erro ao consultar GitHub: {error}")
+
+            if attempt < MAX_RETRIES - 1:
+                retry_wait(attempt)
+
+    raise RuntimeError(
+        "Não foi possível consultar o histórico no GitHub."
     )
-
-    if response.status_code == 404:
-        return {"sent": []}, None
-
-    response.raise_for_status()
-    data = response.json()
-
-    content = base64.b64decode(
-        data["content"]
-    ).decode("utf-8")
-
-    return json.loads(content), data["sha"]
 
 
 def save_state(state, sha):
+
     url = (
         f"https://api.github.com/repos/{REPOSITORY}"
         f"/contents/{STATE_FILE}"
     )
 
     content = base64.b64encode(
-        json.dumps(state, indent=2).encode("utf-8")
+        json.dumps(
+            state,
+            indent=2,
+            ensure_ascii=False
+        ).encode("utf-8")
     ).decode("utf-8")
 
     payload = {
@@ -119,14 +285,45 @@ def save_state(state, sha):
     if sha:
         payload["sha"] = sha
 
-    response = requests.put(
-        url,
-        headers=GH_HEADERS,
-        json=payload,
-        timeout=20
-    )
+    for attempt in range(MAX_RETRIES):
 
-    response.raise_for_status()
+        try:
+            response = requests.put(
+                url,
+                headers=GH_HEADERS,
+                json=payload,
+                timeout=20
+            )
+
+            if response.status_code in (500, 502, 503, 504, 429):
+                print(
+                    f"GitHub erro {response.status_code} "
+                    "ao guardar histórico."
+                )
+                retry_wait(attempt, response)
+                continue
+
+            response.raise_for_status()
+
+            print("Histórico guardado no GitHub.")
+            return True
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        ) as error:
+
+            print(f"Erro ao guardar histórico: {error}")
+
+            if attempt < MAX_RETRIES - 1:
+                retry_wait(attempt)
+
+        except requests.exceptions.HTTPError:
+            raise
+
+    raise RuntimeError(
+        "Não foi possível guardar o histórico no GitHub."
+    )
 
 
 # =====================================
@@ -134,19 +331,26 @@ def save_state(state, sha):
 # =====================================
 
 def stat_value(stats, name):
+
     for item in stats:
+
         if item.get("type") == name:
+
             value = item.get("value")
 
+            if isinstance(value, str):
+                value = value.replace("%", "")
+
             try:
-                return int(value or 0)
+                return int(float(value or 0))
             except (ValueError, TypeError):
                 return 0
 
     return 0
 
-print("DEBUG - Jogo escolhido:", fixture_id)
+
 def get_match_stats(fixture_id):
+
     data = api_get(
         "fixtures/statistics",
         {"fixture": fixture_id}
@@ -173,19 +377,12 @@ def get_match_stats(fixture_id):
     shots_target = 0
 
     for team in data:
+
         stats = team.get("statistics", [])
 
-        corners += stat_value(
-            stats, "Corner Kicks"
-        )
-
-        shots += stat_value(
-            stats, "Total Shots"
-        )
-
-        shots_target += stat_value(
-            stats, "Shots on Goal"
-        )
+        corners += stat_value(stats, "Corner Kicks")
+        shots += stat_value(stats, "Total Shots")
+        shots_target += stat_value(stats, "Shots on Goal")
 
     return corners, shots, shots_target
 
@@ -196,10 +393,16 @@ def get_match_stats(fixture_id):
 
 def get_phase(minute, status):
 
-    if status == "1H" and 35 <= minute <= 45:
+    # Primeira parte: minuto 35 até ao intervalo,
+    # incluindo os minutos de compensação.
+
+    if status == "1H" and minute >= 35:
         return "PRIMEIRA PARTE"
 
-    if status == "2H" and 75 <= minute <= 90:
+    # Final do jogo: minuto 75 até ao fim,
+    # incluindo os minutos de compensação.
+
+    if status == "2H" and minute >= 75:
         return "FINAL DO JOGO"
 
     return None
@@ -220,12 +423,14 @@ def main():
     }
 
     for name, value in required.items():
+
         if not value:
             raise RuntimeError(
                 f"Configuração em falta: {name}"
             )
 
     state, sha = load_state()
+
     sent = set(state.get("sent", []))
 
     fixtures = api_get(
@@ -260,6 +465,7 @@ def main():
         away_goals = goals["away"] or 0
 
         # Jogos equilibrados
+
         if abs(home_goals - away_goals) > 1:
             continue
 
@@ -280,9 +486,12 @@ def main():
         return
 
     # Uma consulta estatística por execução
+
     minute, match, phase, alert_key = candidates[0]
 
     fixture_id = match["fixture"]["id"]
+
+    print("Jogo escolhido:", fixture_id)
 
     stats = get_match_stats(fixture_id)
 
@@ -304,13 +513,18 @@ def main():
         f"À baliza: {shots_target}"
     )
 
-    # Critérios exigentes
+    # =================================
+    # CRITÉRIOS EXIGENTES
+    # =================================
+
     if phase == "PRIMEIRA PARTE":
+
         minimum_corners = 4
         minimum_shots = 8
         minimum_target = 2
 
     else:
+
         minimum_corners = 6
         minimum_shots = 10
         minimum_target = 3
@@ -326,6 +540,10 @@ def main():
     if shots_target < minimum_target:
         print("Rejeitado: poucos remates à baliza.")
         return
+
+    # =================================
+    # PREPARAR ALERTA
+    # =================================
 
     home = match["teams"]["home"]["name"]
     away = match["teams"]["away"]["name"]
@@ -348,6 +566,10 @@ def main():
         "Confirma o jogo antes de qualquer entrada."
     )
 
+    # =================================
+    # ENVIAR E REGISTAR
+    # =================================
+
     telegram(message)
 
     sent.add(alert_key)
@@ -356,7 +578,7 @@ def main():
 
     save_state(state, sha)
 
-    print("Alerta enviado com sucesso!")
+    print("Alerta enviado e registado com sucesso!")
 
 
 if __name__ == "__main__":
